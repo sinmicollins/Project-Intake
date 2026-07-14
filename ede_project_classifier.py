@@ -6,11 +6,11 @@ import argparse
 import textwrap
 from datetime import datetime, timezone
 from typing import Optional
- 
+
 from dotenv import load_dotenv
 from google.cloud import bigquery
 from openai import OpenAI
- 
+
 load_dotenv()
 
 
@@ -87,23 +87,25 @@ TEAM_NAMES = list(TEAM_DEFINITIONS.keys()) + ["Other"]
 # =========================================================================
 # 2. CONFIG (env vars)
 # =========================================================================
- 
+
 FUELIX_API_KEY = os.environ.get("FUELIX_API_KEY", "")
 FUELIX_MODEL = os.environ.get("FUELIX_MODEL", "claude-sonnet-4-5")
 FUELIX_BASE_URL = os.environ.get("FUELIX_BASE_URL", "https://proxy.fuelix.ai")
- 
+
 _fuelix_client = None
- 
- 
+
+
 def get_fuelix_client() -> OpenAI:
     global _fuelix_client
     if _fuelix_client is None:
         _fuelix_client = OpenAI(api_key=FUELIX_API_KEY, base_url=FUELIX_BASE_URL)
     return _fuelix_client
- 
+
+
 INTAKE_TABLE = "`cio-datahub-work-pr-0be526.datahub_temp.bq_jira_project`"
 DEFAULT_GCP_PROJECT = "cio-datahub-work-dv-c03a6c"
 DEFAULT_RESULTS_TABLE = "cio-datahub-work-dv-c03a6c.datahub_operations.ede_ticket_classifications"
+
 
 def _require_config():
     missing = [name for name, val in [("FUELIX_API_KEY", FUELIX_API_KEY)] if not val]
@@ -113,18 +115,11 @@ def _require_config():
             f"Set them in a .env file in this folder, or export them in your shell."
         )
 
- 
-# =========================================================================
+
 # =========================================================================
 # 3. BIGQUERY: FETCH RAW TICKET DATA
 # =========================================================================
-# Uses the REAL schema confirmed from sample rows: flat top-level columns
-# (key, summary, issue_type, status, assignee, jql [which actually holds
-# the project key, e.g. "EDE"]) plus issue_str (the full raw JIRA JSON)
-# for anything not already flattened
-#
-#
- 
+
 INTAKE_QUERY = """
 WITH src AS (
   SELECT
@@ -148,7 +143,8 @@ WHERE TRUE
 ORDER BY ticket_created DESC
 {limit_clause}
 """
- 
+
+
 def adf_to_text(node) -> str:
     """Recursively flatten Jira JSON into plain text."""
     if node is None:
@@ -167,8 +163,8 @@ def adf_to_text(node) -> str:
         for child in node:
             parts.append(adf_to_text(child))
     return "".join(parts)
- 
- 
+
+
 def flatten_description(description_json: Optional[str]) -> str:
     """description_json is the raw JSON string from JSON_EXTRACT (or None/"null")."""
     if not description_json or description_json == "null":
@@ -178,34 +174,34 @@ def flatten_description(description_json: Optional[str]) -> str:
     except (json.JSONDecodeError, TypeError):
         return ""
     return adf_to_text(parsed)
- 
- 
+
+
 FIELD_PATTERN = re.compile(
     r"\*\s*([^*:]+?)\s*:\s*\*?\s*\n?\s*(.+?)(?=\n\s*[•\-]?\s*\*[^*:]+?:\s*|\Z)",
     re.DOTALL,
 )
- 
- 
+
+
 def extract_fields(text: str) -> dict:
     fields = {}
     for label, value in FIELD_PATTERN.findall(text):
         fields[label.strip().lower()] = value.strip()
     return fields
- 
- 
+
+
 TABLE_FIELD_KEYS = ("table path/name or api name", "table name")
 PLATFORM_FIELD_KEYS = ("platform",)
 TITLE_FIELD_KEYS = ("support request title", "defect title")
 DESC_FIELD_KEYS = ("problem description", "please provide a detailed description")
- 
- 
+
+
 def pick_field(fields: dict, keys) -> Optional[str]:
     for k in keys:
         if k in fields and fields[k].strip():
             return fields[k].strip()
     return None
- 
- 
+
+
 def ensure_results_table(client: bigquery.Client, results_table: str) -> None:
     ddl = f"""
     CREATE TABLE IF NOT EXISTS `{results_table}` (
@@ -213,25 +209,25 @@ def ensure_results_table(client: bigquery.Client, results_table: str) -> None:
         team                 STRING,
         confidence_level     INT64,
         reasoning            STRING,
-        signal_used          STRING,
+        signals_used         ARRAY<STRING>,
         ticket_created_date  TIMESTAMP,
         ticket_updated_date  TIMESTAMP,
         classified_at        TIMESTAMP NOT NULL
     )
     """
     client.query(ddl).result()
- 
- 
+
+
 def get_already_classified_keys(client: bigquery.Client, results_table: str) -> list:
     query = f"SELECT ticket_key FROM `{results_table}`"
     try:
         return [row["ticket_key"] for row in client.query(query).result()]
     except Exception:
         # Table may not exist yet on a brand-new setup; ensure_results_table
-        # is always called before this, but fall back gracefully just in case.
+        # is always called before this, but fall back just in case.
         return []
- 
- 
+
+
 def fetch_tickets_from_bq(
     client: bigquery.Client,
     project_key: str,
@@ -241,10 +237,9 @@ def fetch_tickets_from_bq(
     since_date: Optional[str] = None,
 ) -> list:
     since_clause = " AND ticket_created >= TIMESTAMP(@since_date)" if since_date else ""
- 
+
     if ticket_keys:
-        # Explicit --ticket-key mode: always (re)fetch these, ignoring
-        # whatever is already in the results table.
+
         where_clause = f"AND project_key = @project_key AND jira_key IN UNNEST(@ticket_keys){since_clause}"
         limit_clause = ""
         params = [
@@ -258,17 +253,17 @@ def fetch_tickets_from_bq(
             bigquery.ScalarQueryParameter("project_key", "STRING", project_key),
             bigquery.ArrayQueryParameter("already_classified", "STRING", already_classified or [""]),
         ]
- 
+
     if since_date:
         params.append(bigquery.ScalarQueryParameter("since_date", "DATE", since_date))
- 
+
     query = INTAKE_QUERY.format(intake_table=INTAKE_TABLE, where_clause=where_clause, limit_clause=limit_clause)
     job_config = bigquery.QueryJobConfig(query_parameters=params)
     job = client.query(query, job_config=job_config)
     rows = list(job.result())
     return [dict(row.items()) for row in rows]
- 
- 
+
+
 def write_results_to_bq(client: bigquery.Client, results_table: str, results: list) -> None:
     if not results:
         return
@@ -276,43 +271,63 @@ def write_results_to_bq(client: bigquery.Client, results_table: str, results: li
     bq_rows = []
     for r in results:
         if r.get("error"):
-            continue  # don't write failed rows; they'll simply be retried next run
+            continue  # don't write failed rows; they'll be retried next run
         bq_rows.append({
             "ticket_key": r["key"],
             "team": r.get("team"),
             "confidence_level": r.get("confidence_level"),
             "reasoning": r.get("reasoning"),
-            "signal_used": r.get("signal_used"),
+            "signals_used": r.get("signals_used"),
             "ticket_created_date": r.get("ticket_created_date"),
             "ticket_updated_date": r.get("ticket_updated_date"),
             "classified_at": now,
         })
     if not bq_rows:
         return
-    errors = client.insert_rows_json(results_table, bq_rows)
+
+    # Remove any existing row(s) for these ticket keys first, so re-running
+    # a ticket (e.g. via --ticket-key, or a future re-run) replaces its old
+    # result instead of duplicating it.
+    keys = [row["ticket_key"] for row in bq_rows]
+    delete_query = f"DELETE FROM `{results_table}` WHERE ticket_key IN UNNEST(@keys)"
+    delete_job_config = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ArrayQueryParameter("keys", "STRING", keys)]
+    )
+    client.query(delete_query, job_config=delete_job_config).result()
+
+
+    load_job_config = bigquery.LoadJobConfig(
+        source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
+        write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+    )
+    load_job = client.load_table_from_json(bq_rows, results_table, job_config=load_job_config)
+    load_job.result()
+
+    errors = load_job.errors
     if errors:
-        print(f"  ! BigQuery insert errors: {errors}")
+        print(f"  ! BigQuery load errors: {errors}")
+
 
 # =========================================================================
 # 4. LLM CLASSIFICATION (FuelIX)
 # =========================================================================
- 
+
 def build_prompt(title, table_ref, system_ref, description) -> list:
     defs_block = "\n\n".join(f"- {name}: {desc}" for name, desc in TEAM_DEFINITIONS.items())
- 
+
     system_prompt = textwrap.dedent(f"""
         You are a triage assistant for an Enterprise Data Hub (EDE) intake process.
         Every ticket must be routed to exactly one of these five teams, or to "Other"
         if none of the five genuinely fit:
- 
+
         {defs_block}
- 
+
         Decide the team using this priority order:
         1. Table name / dataset the ticket references (if it clearly belongs to one team's data).
         2. System / platform the ticket references (if it clearly maps to one team).
         3. The description of the problem, matched against the team definitions above.
         4. If none of the above give a confident, single-team match, answer "Other".
- 
+
         Also assess your own confidence that this team assignment is correct, as an
         integer from 0 to 100:
         - 80-100: a table name, dataset, or system reference directly and
@@ -322,33 +337,62 @@ def build_prompt(title, table_ref, system_ref, description) -> list:
         - 0-49: the match is a reasonable guess but the ticket is vague, could
           plausibly fit more than one team, or barely fits any of the five
           (this includes most "Other" classifications).
- 
+
+        List EVERY signal that actually supports your team choice (not just the
+        one you weighted most heavily) - e.g. if both a table name AND the
+        description point to the same team, include both. Order the list by
+        priority, highest first (table_name, then system_name, then
+        description). If nothing meaningfully supports the choice, use ["none"].
+
         Respond with ONLY a JSON object, no markdown fences, in this exact shape:
         {{"team": "<one of: {', '.join(TEAM_NAMES)}>",
           "confidence": <integer 0-100>,
-          "signal_used": "<table_name|system_name|description|none>",
+          "signals_used": ["<table_name|system_name|description|none>", ...],
           "reasoning": "<1-3 sentences explaining why you picked this team>"}}
     """).strip()
- 
+
     user_prompt = textwrap.dedent(f"""
         Ticket title: {title or "(none provided)"}
         Table / API reference: {table_ref or "(none provided)"}
         System / platform: {system_ref or "(none provided)"}
- 
+
         Description:
         {description or "(none provided)"}
     """).strip()
- 
+
     return [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
- 
- 
+
+
+# Valid signal labels, in priority order - used to validate and sort
+# whatever the model returns in "signals_used".
+SIGNAL_PRIORITY = ["table_name", "system_name", "description", "none"]
+
+
+def normalize_signals(raw_signals) -> list:
+    """Validate the model's signals_used value and sort it by SIGNAL_PRIORITY.
+
+    Accepts a list (expected) or a bare string (in case the model ignores
+    the array format), drops anything not in SIGNAL_PRIORITY, dedupes, and
+    falls back to ["none"] if nothing valid remains.
+    """
+    if isinstance(raw_signals, str):
+        raw_signals = [raw_signals]
+    if not isinstance(raw_signals, list):
+        raw_signals = []
+
+    valid = {s for s in raw_signals if s in SIGNAL_PRIORITY}
+    if not valid:
+        return ["none"]
+    return [s for s in SIGNAL_PRIORITY if s in valid]
+
+
 def classify_with_ai(title, table_ref, system_ref, description) -> dict:
     messages = build_prompt(title, table_ref, system_ref, description)
     client = get_fuelix_client()
- 
+
     response = client.chat.completions.create(
         model=FUELIX_MODEL,
         messages=messages,
@@ -357,50 +401,52 @@ def classify_with_ai(title, table_ref, system_ref, description) -> dict:
     )
     raw = response.choices[0].message.content.strip()
     raw = re.sub(r"^```(?:json)?|```$", "", raw.strip(), flags=re.MULTILINE).strip()
- 
+
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError:
         parsed = {
             "team": "Other",
             "confidence": 20,
-            "signal_used": "none",
+            "signals_used": ["none"],
             "reasoning": f"Model response was not valid JSON, defaulted to Other. Raw response: {raw[:300]}",
         }
- 
+
     if parsed.get("team") not in TEAM_NAMES:
         parsed["team"] = "Other"
- 
+
     try:
         confidence = int(parsed.get("confidence"))
         confidence = max(0, min(100, confidence))
     except (TypeError, ValueError):
         confidence = 20  # conservative fallback if the model didn't return a usable number
     parsed["confidence"] = confidence
- 
+
+    parsed["signals_used"] = normalize_signals(parsed.get("signals_used"))
+
     return parsed
 
 
 # =========================================================================
 # 5. MAIN
 # =========================================================================
- 
+
 def process_row(row: dict) -> dict:
     key = row.get("jira_key")
- 
+
     description_text = flatten_description(row.get("description_json"))
     fields = extract_fields(description_text)
- 
+
     title = pick_field(fields, TITLE_FIELD_KEYS) or row.get("summary")
     table_ref = pick_field(fields, TABLE_FIELD_KEYS)
     system_ref = pick_field(fields, PLATFORM_FIELD_KEYS)
     problem_desc = pick_field(fields, DESC_FIELD_KEYS) or description_text
- 
+
     result = classify_with_ai(title, table_ref, system_ref, problem_desc)
- 
+
     def _iso(dt):
         return dt.isoformat() if dt else None
- 
+
     return {
         "key": key,
         "title": title,
@@ -408,13 +454,13 @@ def process_row(row: dict) -> dict:
         "system_ref": system_ref,
         "team": result.get("team", "Other"),
         "confidence_level": result.get("confidence", 20),
-        "signal_used": result.get("signal_used", "none"),
+        "signals_used": result.get("signals_used", ["none"]),
         "reasoning": result.get("reasoning", ""),
         "ticket_created_date": _iso(row.get("ticket_created")),
         "ticket_updated_date": _iso(row.get("ticket_updated")),
     }
- 
- 
+
+
 def main():
     parser = argparse.ArgumentParser(description="Classify unclassified EDE front-door intake tickets by owning team, sourced from and written to BigQuery.")
     parser.add_argument("--gcp-project", default=DEFAULT_GCP_PROJECT, help=f"GCP project ID to bill/run BigQuery jobs under. Default: {DEFAULT_GCP_PROJECT}")
@@ -425,18 +471,18 @@ def main():
     parser.add_argument("--limit", type=int, default=20, help="Max new/unclassified tickets to process per run (ignored if --ticket-key is set)")
     parser.add_argument("--out", default="classification_results.json", help="Local JSON copy of this run's results, for quick review")
     args = parser.parse_args()
- 
+
     _require_config()
- 
+
     client = bigquery.Client(project=args.gcp_project)
     ensure_results_table(client, args.results_table)
- 
+
     ticket_keys = [k.strip() for k in args.ticket_key.split(",")] if args.ticket_key else None
     already_classified = [] if ticket_keys else get_already_classified_keys(client, args.results_table)
- 
+
     rows = fetch_tickets_from_bq(client, args.project_key, ticket_keys, already_classified, args.limit, since_date=args.since or None)
     print(f"Fetched {len(rows)} ticket(s) to classify.")
- 
+
     results = []
     for row in rows:
         try:
@@ -446,20 +492,19 @@ def main():
             print(f"  ! {row.get('jira_key')}: ERROR {e}")
             results.append(r)
             continue
- 
-        print(f"  {r['key']}  ->  {r['team']}  [{r['confidence_level']}% confidence]  (via {r['signal_used']})")
+
+        print(f"  {r['key']}  ->  {r['team']}  [{r['confidence_level']}% confidence]  (via {', '.join(r['signals_used'])})")
         print(f"      {r['reasoning']}")
         results.append(r)
- 
+
     write_results_to_bq(client, args.results_table, results)
- 
+
     with open(args.out, "w") as f:
         json.dump(results, f, indent=2)
- 
+
     written = sum(1 for r in results if not r.get("error"))
     print(f"\nWrote {written} result(s) to `{args.results_table}` and a local copy to {args.out}")
- 
- 
+
+
 if __name__ == "__main__":
     main()
- 
